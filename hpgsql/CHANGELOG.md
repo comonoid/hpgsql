@@ -1,6 +1,7 @@
 ## v0.4.0
 
 - Around 16% performance improvements in row decoding performance
+- Connection timeouts now cover the whole connection attempt (socket connection, startup handshake, authentication and the initial type info cache refresh) instead of only the TCP connection. A non-positive timeout now means "wait indefinitely", matching libpq's `connect_timeout`.
 
 No breaking API changes in non-Internal modules in this version, but we now recommend using `fieldRowDecoder` instead of `singleField fieldDecoder` where you can. They're equivalent when compiling with -O1 due to rewrite rules, but the former is more performant when compiling with no optimizations.
 

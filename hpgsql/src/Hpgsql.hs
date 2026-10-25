@@ -24,7 +24,7 @@
 -- >         , database = "mydb"
 -- >         , options  = ""
 -- >         }
--- >   -- Connect with a 10-second timeout
+-- >   -- Connect, with a 10-second timeout for the whole connection attempt
 -- >   withConnection connstr 10 $ \conn -> do
 -- >     rows <- query conn [sql|SELECT 1 + 1|]
 -- >     print (rows :: [Only Int])

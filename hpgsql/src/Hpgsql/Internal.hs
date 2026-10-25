@@ -213,14 +213,42 @@ fullTransactionStatus sttv = do
 transactionStatus :: HPgConnection -> IO TransactionStatus
 transactionStatus conn = snd <$> STM.atomically (fullTransactionStatus conn.internalConnectionState)
 
+-- | Connects to PostgreSQL.
+--
+-- The supplied timeout bounds the whole connection attempt: the socket
+-- connection, the startup message, authentication, and (unless
+-- `fillTypeInfoCache` is disabled) the initial type information cache refresh.
+--
+-- A non-positive timeout means "wait indefinitely", matching libpq's
+-- @connect_timeout@. Host name resolution is performed by a blocking foreign
+-- call which cannot be interrupted, so it may exceed the timeout.
 connect :: ConnectionString -> DiffTime -> IO HPgConnection
 connect =
   connectOpts defaultConnectOpts
 
+-- | Like 'connect', but uses the supplied 'ConnectOpts'. The timeout has the
+-- same meaning as in 'connect'.
 connectOpts :: ConnectOpts -> ConnectionString -> DiffTime -> IO HPgConnection
-connectOpts =
-  internalConnectOrCancel
-    Connect
+connectOpts connOpts connStr conntimeout = do
+  resultOrTimeout <-
+    timeout (connectTimeoutMicros conntimeout) $
+      internalConnectOrCancel Connect connOpts connStr conntimeout
+  case resultOrTimeout of
+    Nothing -> throwIrrecoverableError "Could not connect in the supplied timeout"
+    Just conn -> pure conn
+
+-- | `System.Timeout.timeout` takes microseconds as an `Int`. A non-positive
+-- timeout means "wait indefinitely", matching libpq's `connect_timeout`.
+-- We round up to one microsecond and clamp to `maxBound` so that long timeouts
+-- do not overflow `Int` on 32-bit platforms.
+connectTimeoutMicros :: DiffTime -> Int
+connectTimeoutMicros conntimeout
+  | conntimeout <= 0 = -1
+  | otherwise =
+      fromInteger $
+        min
+          (toInteger (maxBound :: Int))
+          (max 1 (diffTimeToPicoseconds conntimeout `div` 1_000_000))
 
 defaultConnectOpts :: ConnectOpts
 defaultConnectOpts =
@@ -237,7 +265,7 @@ data InternalConnectOrCancelRequest a where
 
 internalConnectOrCancel :: InternalConnectOrCancelRequest a -> ConnectOpts -> ConnectionString -> DiffTime -> IO a
 internalConnectOrCancel connectOrCancel connOpts originalConnStr@ConnectionString {..} conntimeout = do
-  sockOrTimeout <- timeout (fromInteger $ diffTimeToPicoseconds conntimeout `div` 1_000_000) getConnectedSocket
+  sockOrTimeout <- timeout (connectTimeoutMicros conntimeout) getConnectedSocket
   case sockOrTimeout of
     Nothing -> throwIrrecoverableError "Could not connect in the supplied timeout"
     -- TODO: It's still possible for an asynchronous exception to interrupt this before the `onException` handler is installed
@@ -484,12 +512,16 @@ closeInternalFinally conn f = do
   isClosed <- readMVar conn.socketClosed
   unless isClosed $ finally f (Socket.close conn.socket >> modifyMVar_ conn.socketClosed (const $ pure True))
 
+-- | Like 'connect', but closes the connection when the callback returns or
+-- throws. The timeout has the same meaning as in 'connect'.
 withConnection :: ConnectionString -> DiffTime -> (HPgConnection -> IO a) -> IO a
 withConnection connstr conntimeout f = bracketOnError (connect connstr conntimeout) closeForcefully $ \conn -> do
   res <- f conn
   closeGracefully conn
   pure res
 
+-- | Like 'withConnection', but uses the supplied 'ConnectOpts'. The timeout has
+-- the same meaning as in 'connect'.
 withConnectionOpts :: ConnectOpts -> ConnectionString -> DiffTime -> (HPgConnection -> IO a) -> IO a
 withConnectionOpts connOpts connstr conntimeout f = bracketOnError (connectOpts connOpts connstr conntimeout) closeForcefully $ \conn -> do
   res <- f conn
