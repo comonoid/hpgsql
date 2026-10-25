@@ -26,6 +26,7 @@ executable hpgsql-tests
   other-modules:
       AllSpecs
       BasicTestsSpec
+      ConnectTimeoutSpec
       ConnectivitySpec
       CopySpec
       DbUtils
@@ -92,6 +93,7 @@ executable hpgsql-tests
     , hpgsql
     , hspec
     , hspec-hedgehog
+    , network
     , network-uri
     , postgresql-simple
     , random
