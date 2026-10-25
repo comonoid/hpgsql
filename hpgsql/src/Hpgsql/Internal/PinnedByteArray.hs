@@ -48,6 +48,7 @@ module Hpgsql.Internal.PinnedByteArray
     copyStrictSlice,
     createPinnedByteArray,
     drop,
+    dropAndTake,
     emptyLazyPBA,
     emptyPBA,
     fromByteString,
@@ -70,6 +71,7 @@ module Hpgsql.Internal.PinnedByteArray
     decodeWord32BE,
     decodeWord64BE,
     encodeInt32BE,
+    encodeWord32BE,
     encodeDouble,
     encodeFloat,
     encodeInt64BE,
@@ -187,6 +189,14 @@ drop (max 0 -> n) (PinnedByteArray start len arr#) =
 take :: Int -> PinnedByteArray -> PinnedByteArray
 take (max 0 -> n) (PinnedByteArray start len arr#) =
   PinnedByteArray start (min n len) arr#
+
+-- | @dropAndTake start n pba@ is equivalent to @take n (drop start pba)@, but
+-- without the intermediate allocation.
+dropAndTake :: Int -> Int -> PinnedByteArray -> PinnedByteArray
+dropAndTake (max 0 -> start) (max 0 -> n) (PinnedByteArray s len arr#) =
+  if start >= len
+    then emptyPBA
+    else PinnedByteArray (s + start) (min n (len - start)) arr#
 
 fromStrict :: PinnedByteArray -> LazyPinnedByteArray
 fromStrict pba@(PinnedByteArray _ len _) = LazyPinnedByteArray len [pba]
@@ -317,6 +327,10 @@ decodeInt32BE idx bs = fromIntegral <$> decodeWord CWord32 idx bs fromBigEndian3
 {-# INLINE encodeInt32BE #-}
 encodeInt32BE :: Int32 -> ByteString
 encodeInt32BE n = unsafeEncodeWord (fromIntegral n) fromBigEndian32 4
+
+{-# INLINE encodeWord32BE #-}
+encodeWord32BE :: Word32 -> ByteString
+encodeWord32BE n = unsafeEncodeWord n fromBigEndian32 4
 
 {-# INLINE decodeInt64BE #-}
 decodeInt64BE :: ByteStringIdx -> PinnedByteArray -> Either String Int64

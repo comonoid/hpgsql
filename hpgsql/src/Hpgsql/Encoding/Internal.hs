@@ -73,7 +73,7 @@ import Data.Text.Encoding (encodeUtf8)
 import qualified Data.Text.Lazy as LT
 import qualified Data.Text.Lazy.Encoding as LT
 import Data.Time (CalendarDiffDays (..), CalendarDiffTime (..), Day, LocalTime (..), NominalDiffTime, TimeOfDay, UTCTime (..), ZonedTime, diffDays, diffTimeToPicoseconds, fromGregorian, picosecondsToDiffTime, secondsToNominalDiffTime, timeOfDayToTime, timeToTimeOfDay, utc, utcToZonedTime, zonedTimeToUTC)
-import Data.Time.Calendar.Julian (addJulianDurationClip, fromJulian)
+import Data.Time.Calendar.Julian (addJulianDurationClip)
 import Data.Tuple.Only (Only (..))
 import Data.UUID.Types (UUID)
 import qualified Data.UUID.Types as UUID
@@ -330,7 +330,7 @@ compositeTypeEncoder rowEnc =
             numCols = Builder.int32BE (fromIntegral $ length fields)
             encodeField (mOid, bf) =
               let Oid oid = fromMaybe (Oid 0) mOid
-               in Builder.int32BE oid <> Builder.binaryField bf
+               in Builder.int32BE (fromIntegral oid) <> Builder.binaryField bf
          in NotNull (Builder.toStrictByteString (numCols <> foldMap encodeField fields))
     }
 
@@ -453,7 +453,7 @@ instance ToPgField Oid where
   fieldEncoder =
     FieldEncoder
       { toTypeOid = \_ -> Just oidOid,
-        toPgField = \_ -> \n -> NotNull $ PBA.encodeInt32BE $ fromIntegral n
+        toPgField = \_ -> \(Oid n) -> NotNull $ PBA.encodeWord32BE n
       }
 
 instance ToPgField Scientific where
@@ -548,7 +548,7 @@ instance ToPgField UTCTime where
       { toTypeOid = \_ -> Just timestamptzOid,
         -- TODO: Catch integer overflow and do what?
         toPgField = \_ (UTCTime parsedDate timeinday) ->
-          let day :: Int64 = fromInteger $ parsedDate `diffDays` fromJulian 1999 12 19
+          let day :: Int64 = fromInteger $ parsedDate `diffDays` fromGregorian 2000 1 1
               totalusecs :: Int64 = 86_400_000_000 * day + fromInteger (diffTimeToPicoseconds timeinday `div` 1_000_000)
            in NotNull $ PBA.encodeInt64BE totalusecs
       }
@@ -588,7 +588,7 @@ instance ToPgField LocalTime where
     FieldEncoder
       { toTypeOid = \_ -> Just timestampOid,
         toPgField = \_ (LocalTime localDay localTimeOfDay) ->
-          let day :: Int64 = fromInteger $ localDay `diffDays` fromJulian 1999 12 19
+          let day :: Int64 = fromInteger $ localDay `diffDays` fromGregorian 2000 1 1
               totalusecs :: Int64 = 86_400_000_000 * day + fromInteger (diffTimeToPicoseconds (timeOfDayToTime localTimeOfDay) `div` 1_000_000)
            in NotNull $ PBA.encodeInt64BE totalusecs
       }
@@ -1029,15 +1029,15 @@ instance FromPgField Integer where
 oidFieldDecoder :: FieldDecoder Oid
 oidFieldDecoder = parsePgType "Oid" [oidOid] $ const $ \case
   Nothing -> Left "Cannot decode SQL null as the Haskell Oid type. Use a `Maybe Oid`"
-  -- Oids are just int4
-  Just bs -> Oid <$> PBA.decodeInt32BE 0 (PBA.fromByteString bs)
+  -- Oids are unsigned 32-bit integers
+  Just bs -> Oid <$> PBA.decodeWord32BE 0 (PBA.fromByteString bs)
 
 instance FromPgField Oid where
   {-# INLINE fieldDecoder #-}
   fieldDecoder = oidFieldDecoder
 
   {-# INLINE specializedFieldDecoder #-}
-  specializedFieldDecoder = const $ fmap Oid <$> Parser.takeInt32BEWithFieldLength
+  specializedFieldDecoder = const $ fmap (Oid . fromIntegral) <$> Parser.takeInt32BEWithFieldLength
 
 {-# RULES
 "singleField floatFieldDecoder" singleField floatFieldDecoder = fieldRowDecoder
@@ -1187,9 +1187,6 @@ instance FromPgField (Ratio Integer) where
   {-# INLINE specializedFieldDecoder #-}
   specializedFieldDecoder = \finfo -> let sciDec = specializedFieldDecoder finfo in fmap (toRational :: Scientific -> Rational) <$> sciDec
 
-binaryTrue :: PinnedByteArray
-binaryTrue = PBA.fromByteString $ PBA.encodePgBoolean True
-
 {-# RULES
 "singleField boolFieldDecoder" singleField boolFieldDecoder = fieldRowDecoder
 "singleField (nullableField boolFieldDecoder)" singleField (nullableField boolFieldDecoder) = fieldRowDecoder
@@ -1199,11 +1196,22 @@ binaryTrue = PBA.fromByteString $ PBA.encodePgBoolean True
 boolFieldDecoder :: FieldDecoder Bool
 boolFieldDecoder = parsePgType "Bool" [boolOid] $ const $ \case
   Nothing -> Left "Cannot decode SQL null as the Haskell Bool type. Use a `Maybe Bool`"
-  Just bs -> Right $ PBA.fromByteString bs == binaryTrue
+  Just bs -> case BS.uncons bs of
+    Just (w, rest) | BS.null rest -> case w of
+      0 -> Right False
+      1 -> Right True
+      _ -> Left "Invalid value for postgres bool type (must be 0 or 1)"
+    _ -> Left "Invalid value for postgres bool type (must be a single byte)"
 
 {-# INLINE boolRowDecoder #-}
 boolRowDecoder :: Parser.Parser (Maybe Bool)
-boolRowDecoder = fmap (== 1) <$> Parser.parsePgFieldWithAtMost4Bytes PBA.TypeSize1
+boolRowDecoder = do
+  mw <- Parser.parsePgFieldWithAtMost4Bytes PBA.TypeSize1
+  case mw of
+    Nothing -> pure Nothing
+    Just 0 -> pure (Just False)
+    Just 1 -> pure (Just True)
+    Just _ -> fail "Invalid value for postgres bool type (must be 0 or 1)"
 
 instance FromPgField Bool where
   {-# INLINE fieldDecoder #-}
@@ -1226,7 +1234,9 @@ charFieldDecoder = parsePgType "Char" [charOid, textOid, varcharOid, nameOid, bp
   if rootBaseTypeOf finfo == charOid
     then \case
       Nothing -> Left "Cannot decode SQL null as the Haskell Char type. Use a `Maybe Char`"
-      Just bs -> Right $ chr (fromIntegral (BS.head bs))
+      Just bs -> case BS.uncons bs of
+        Just (w, rest) | BS.null rest -> Right $ chr (fromIntegral w)
+        _ -> Left "Cannot decode a value that is not exactly one byte as a Haskell Char"
     else
       let !decodeText = (fieldDecoder @Text).fieldValueDecoder finfo
        in \mbs -> case decodeText mbs of
@@ -1401,7 +1411,7 @@ utcTimeFieldDecoder = parsePgType "UTCTime" [timestamptzOid] $ const $ \case
     -- See https://github.com/postgres/postgres/blob/50cb7505b3010736b9a7922e903931534785f3aa/src/backend/utils/adt/timestamp.c#L1909
     totalusecs <- PBA.decodeInt64BE 0 (PBA.fromByteString bs)
     let (day, timeusecs) = totalusecs `divMod` 86_400_000_000 -- USECS per day
-        parsedDate = addJulianDurationClip (CalendarDiffDays 0 (fromIntegral day)) $ fromJulian 1999 12 19
+        parsedDate = addJulianDurationClip (CalendarDiffDays 0 (fromIntegral day)) $ fromGregorian 2000 1 1
     Right $ UTCTime parsedDate (picosecondsToDiffTime $ fromIntegral timeusecs * 1_000_000)
 
 {-# INLINE utcTimeRowDecoder #-}
@@ -1412,7 +1422,7 @@ utcTimeRowDecoder = do
     8 -> do
       totalusecs <- Parser.takeInt64BE
       let (day, timeusecs) = totalusecs `divMod` 86_400_000_000 -- USECS per day
-          parsedDate = addJulianDurationClip (CalendarDiffDays 0 (fromIntegral day)) $ fromJulian 1999 12 19
+          parsedDate = addJulianDurationClip (CalendarDiffDays 0 (fromIntegral day)) $ fromGregorian 2000 1 1
       pure $ Just $ UTCTime parsedDate (picosecondsToDiffTime $ fromIntegral timeusecs * 1_000_000)
     _ -> pure Nothing
 
@@ -1443,7 +1453,7 @@ unboundedUtcTimeFieldDecoder = parsePgType "Unbounded UTCTime" [timestamptzOid] 
             then PosInfinity
             else
               let (day, timeusecs) = totalusecs `divMod` 86_400_000_000 -- USECS per day
-                  parsedDate = addJulianDurationClip (CalendarDiffDays 0 (fromIntegral day)) $ fromJulian 1999 12 19
+                  parsedDate = addJulianDurationClip (CalendarDiffDays 0 (fromIntegral day)) $ fromGregorian 2000 1 1
                in Finite $ UTCTime parsedDate (picosecondsToDiffTime $ fromIntegral timeusecs * 1_000_000)
 
 {-# INLINE unboundedUtcTimeRowDecoder #-}
@@ -1462,7 +1472,7 @@ unboundedUtcTimeRowDecoder = do
                 then PosInfinity
                 else
                   let (day, timeusecs) = totalusecs `divMod` 86_400_000_000 -- USECS per day
-                      parsedDate = addJulianDurationClip (CalendarDiffDays 0 (fromIntegral day)) $ fromJulian 1999 12 19
+                      parsedDate = addJulianDurationClip (CalendarDiffDays 0 (fromIntegral day)) $ fromGregorian 2000 1 1
                    in Finite $ UTCTime parsedDate (picosecondsToDiffTime $ fromIntegral timeusecs * 1_000_000)
     _ -> pure Nothing
 
@@ -1486,7 +1496,7 @@ zonedTimeFieldDecoder = parsePgType "ZonedTime" [timestamptzOid] $ const $ \case
     -- See https://github.com/postgres/postgres/blob/50cb7505b3010736b9a7922e903931534785f3aa/src/backend/utils/adt/timestamp.c#L1909
     totalusecs <- PBA.decodeInt64BE 0 (PBA.fromByteString bs)
     let (day, timeusecs) = totalusecs `divMod` 86_400_000_000 -- USECS per day
-        parsedDate = addJulianDurationClip (CalendarDiffDays 0 (fromIntegral day)) $ fromJulian 1999 12 19
+        parsedDate = addJulianDurationClip (CalendarDiffDays 0 (fromIntegral day)) $ fromGregorian 2000 1 1
     Right $ utcToZonedTime utc $ UTCTime parsedDate (picosecondsToDiffTime $ fromIntegral timeusecs * 1_000_000)
 
 {-# INLINE zonedTimeRowDecoder #-}
@@ -1497,7 +1507,7 @@ zonedTimeRowDecoder = do
     8 -> do
       totalusecs <- Parser.takeInt64BE
       let (day, timeusecs) = totalusecs `divMod` 86_400_000_000 -- USECS per day
-          parsedDate = addJulianDurationClip (CalendarDiffDays 0 (fromIntegral day)) $ fromJulian 1999 12 19
+          parsedDate = addJulianDurationClip (CalendarDiffDays 0 (fromIntegral day)) $ fromGregorian 2000 1 1
       pure $ Just $ utcToZonedTime utc $ UTCTime parsedDate (picosecondsToDiffTime $ fromIntegral timeusecs * 1_000_000)
     _ -> pure Nothing
 
@@ -1528,7 +1538,7 @@ unboundedZonedTimeFieldDecoder = parsePgType "Unbounded ZonedTime" [timestamptzO
             then PosInfinity
             else
               let (day, timeusecs) = totalusecs `divMod` 86_400_000_000 -- USECS per day
-                  parsedDate = addJulianDurationClip (CalendarDiffDays 0 (fromIntegral day)) $ fromJulian 1999 12 19
+                  parsedDate = addJulianDurationClip (CalendarDiffDays 0 (fromIntegral day)) $ fromGregorian 2000 1 1
                in Finite $ utcToZonedTime utc $ UTCTime parsedDate (picosecondsToDiffTime $ fromIntegral timeusecs * 1_000_000)
 
 {-# INLINE unboundedZonedTimeRowDecoder #-}
@@ -1547,7 +1557,7 @@ unboundedZonedTimeRowDecoder = do
                 then PosInfinity
                 else
                   let (day, timeusecs) = totalusecs `divMod` 86_400_000_000 -- USECS per day
-                      parsedDate = addJulianDurationClip (CalendarDiffDays 0 (fromIntegral day)) $ fromJulian 1999 12 19
+                      parsedDate = addJulianDurationClip (CalendarDiffDays 0 (fromIntegral day)) $ fromGregorian 2000 1 1
                    in Finite $ utcToZonedTime utc $ UTCTime parsedDate (picosecondsToDiffTime $ fromIntegral timeusecs * 1_000_000)
     _ -> pure Nothing
 
@@ -1570,7 +1580,7 @@ localTimeFieldDecoder = parsePgType "LocalTime" [timestampOid] $ const $ \case
   Just bs -> do
     totalusecs <- PBA.decodeInt64BE 0 (PBA.fromByteString bs)
     let (day, timeusecs) = totalusecs `divMod` 86_400_000_000 -- USECS per day
-        parsedDate = addJulianDurationClip (CalendarDiffDays 0 (fromIntegral day)) $ fromJulian 1999 12 19
+        parsedDate = addJulianDurationClip (CalendarDiffDays 0 (fromIntegral day)) $ fromGregorian 2000 1 1
     Right $ LocalTime parsedDate (timeToTimeOfDay $ picosecondsToDiffTime $ fromIntegral timeusecs * 1_000_000)
 
 {-# INLINE localTimeRowDecoder #-}
@@ -1581,7 +1591,7 @@ localTimeRowDecoder = do
     8 -> do
       totalusecs <- Parser.takeInt64BE
       let (day, timeusecs) = totalusecs `divMod` 86_400_000_000 -- USECS per day
-          parsedDate = addJulianDurationClip (CalendarDiffDays 0 (fromIntegral day)) $ fromJulian 1999 12 19
+          parsedDate = addJulianDurationClip (CalendarDiffDays 0 (fromIntegral day)) $ fromGregorian 2000 1 1
       pure $ Just $ LocalTime parsedDate (timeToTimeOfDay $ picosecondsToDiffTime $ fromIntegral timeusecs * 1_000_000)
     _ -> pure Nothing
 
@@ -1632,16 +1642,14 @@ dayFieldDecoder :: FieldDecoder Day
 dayFieldDecoder = parsePgType "Day" [dateOid] $ const $ \case
   Nothing -> Left "Cannot decode SQL null as the Haskell Day type. Use a `Maybe Day`"
   Just bs -> do
-    -- There is a very specific conversion function for these, which I poorly translated to Haskell
-    -- https://github.com/postgres/postgres/blob/799959dc7cf0e2462601bea8d07b6edec3fa0c4f/src/backend/utils/adt/datetime.c#L321
-    -- But I found a simpler way to do this. Let's see if it works in our property based tests
+    -- PostgreSQL dates are stored as the number of days since 2000-01-01.
     jd <- PBA.decodeInt32BE 0 (PBA.fromByteString bs)
-    Right $ addJulianDurationClip (CalendarDiffDays 0 (fromIntegral jd - 13)) $ fromJulian 2000 01 01
+    Right $ addJulianDurationClip (CalendarDiffDays 0 (fromIntegral jd)) $ fromGregorian 2000 1 1
 
 {-# INLINE dayRowDecoder #-}
 dayRowDecoder :: Parser.Parser (Maybe Day)
 dayRowDecoder =
-  let int32ToDay (i32 :: Int32) = let jd = fromIntegral i32 :: Integer in addJulianDurationClip (CalendarDiffDays 0 (jd - 13)) $ fromJulian 2000 01 01
+  let int32ToDay (i32 :: Int32) = let jd = fromIntegral i32 :: Integer in addJulianDurationClip (CalendarDiffDays 0 jd) $ fromGregorian 2000 1 1
    in fmap int32ToDay <$> Parser.takeInt32BEWithFieldLength
 
 instance FromPgField Day where
@@ -1661,9 +1669,7 @@ unboundedDayFieldDecoder :: FieldDecoder (Unbounded Day)
 unboundedDayFieldDecoder = parsePgType "Unbounded Day" [dateOid] $ const $ \case
   Nothing -> Left "Cannot decode SQL null as the Haskell Unbounded Day type. Use a `Maybe (Unbounded Day)`"
   Just bs -> do
-    -- There is a very specific conversion function for these, which I poorly translated to Haskell
-    -- https://github.com/postgres/postgres/blob/799959dc7cf0e2462601bea8d07b6edec3fa0c4f/src/backend/utils/adt/datetime.c#L321
-    -- But I found a simpler way to do this. Let's see if it works in our property based tests
+    -- PostgreSQL dates are stored as the number of days since 2000-01-01.
     jd <- PBA.decodeInt32BE 0 (PBA.fromByteString bs)
     Right $
       if jd == minBound
@@ -1672,7 +1678,7 @@ unboundedDayFieldDecoder = parsePgType "Unbounded Day" [dateOid] $ const $ \case
           if jd == maxBound
             then PosInfinity
             else
-              Finite $ addJulianDurationClip (CalendarDiffDays 0 (fromIntegral jd - 13)) $ fromJulian 2000 01 01
+              Finite $ addJulianDurationClip (CalendarDiffDays 0 (fromIntegral jd)) $ fromGregorian 2000 1 1
 
 instance FromPgField (Unbounded Day) where
   {-# INLINE fieldDecoder #-}
@@ -1792,7 +1798,9 @@ instance (FromPgField a) => FromPgField (Maybe a) where
 allowOnlyArrayTypes :: FieldInfo -> Bool
 allowOnlyArrayTypes fieldInfo =
   -- TODO: We could check the elemTypeOid too, but maybe later
-  case lookupTypeByOid fieldInfo.fieldTypeOid fieldInfo.encodingContext.typeInfoCache of
+  -- Resolve domains to their base type, so that a domain over an array type is
+  -- (correctly) accepted by the array decoders.
+  case lookupTypeByOid (rootBaseTypeOf fieldInfo) fieldInfo.encodingContext.typeInfoCache of
     Just (TypeInfo {typeDetails = ArrayType _}) -> True
     Nothing -> True -- Assume user knows what they're doing
     Just _ -> False -- Definitely not an array
@@ -2032,7 +2040,7 @@ toPgVectorField encCtx =
             -- Postgres seems to build the "has_nulls" flag itself in the ReadArrayBinary function at https://github.com/postgres/postgres/blob/aa7f9493a02f5981c09b924323f0e7a58a32f2ed/src/backend/utils/adt/arrayfuncs.c#L1429, so we can just set it to 0
             hasNull = Builder.byteString $ PBA.encodeInt32BE 0
             -- hasNull = Builder.byteString $ PBA.encodeInt32BE (if Vector.any (\e -> toPgField e == Nothing) vec then 1 else 0)
-            elemOidBs = Builder.byteString $ PBA.encodeInt32BE elemOid
+            elemOidBs = Builder.byteString $ PBA.encodeWord32BE elemOid
             lb1 = Builder.byteString $ PBA.encodeInt32BE 1
             (Sum len, encodedElements) = foldMap (\el -> (Sum 1, encodeElement el)) vec
             dim1 = Builder.byteString $ PBA.encodeInt32BE len

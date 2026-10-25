@@ -85,7 +85,7 @@ sqlStatementParser popts isBeginningOfStmt = do
       many1 (CommentsOrWhitespace <$> takeWhile1 Char.isSpace <|> doubleDashComment <|> cStyleComment)
 
 eol :: Parser Text
-eol = string "\n" <|> string "\r\n"
+eol = string "\r\n" <|> string "\n" <|> string "\r"
 
 blockText :: BlockOrNotBlock -> Text
 blockText = \case
@@ -150,7 +150,11 @@ isPossibleBlockStartingChar popts c =
     || c
       == 'E'
     || c
-      == '?'
+      == 'e'
+    || ( case popts of
+           AcceptQuestionMarksAsQueryArgs -> c == '?'
+           _ -> False
+       )
     || ( case popts of
            AcceptQuasiQuoterExpressions _ -> c == '#' || c == '^'
            _ -> False
@@ -231,7 +235,7 @@ cStyleComment = fmap CommentsOrWhitespace $ do
             -- Handle other characters
             (True, True, _) ->
               error
-                "Report this as a bug in codd: C Style comment parser invalid state"
+                "Report this as a bug in hpgsql: C Style comment parser invalid state"
             _ -> Just (openCommentCount, False, False)
       )
   end <- string "/" <|> "" <$ endOfInput -- We are generous with eof and allow even invalid SQL in many places
@@ -262,35 +266,28 @@ parenthesisedExpression popts = do
           rest <- insideParenParser -- We're still inside an openParen after parsing a block or a character
           pure $ StaticSql more : blocksOrOtherwise ++ rest
 
--- | Parses a value using backslash as an escape char for any char that matches
--- the supplied predicate. Does not consume the ending char and RETURNS any
--- backslash escape chars in the result.
--- Use `parseWithEscapeCharProper` to exclude the escape chars from the result.
--- This function is useful if you want the original parsed contents.
-parseWithEscapeCharPreserve :: (Char -> Bool) -> Parser Text
-parseWithEscapeCharPreserve untilc = do
-  cs <- Parsec.takeWhile (\c -> c /= '\\' && not (untilc c))
-  nextChar <- peekChar
-  case nextChar of
-    Just '\\' -> do
-      c <- Parsec.take 2
-      rest <- parseWithEscapeCharPreserve untilc
-      pure $ cs <> c <> rest
-    _ -> pure cs
-
 doubleQuotedIdentifier :: Parser BlockOrNotBlock
 doubleQuotedIdentifier = fmap StaticSql $ do
   openingQuote <- string "\""
-  rest <- parseWithEscapeCharPreserve (== '"')
-  ending <- string "\""
-  pure $ openingQuote <> rest <> ending
+  -- PostgreSQL escapes a double quote in an identifier by doubling it (`""`),
+  -- not with a backslash.
+  rest <-
+    Parsec.scan
+      False
+      ( \lastCharWasQuote c -> case (lastCharWasQuote, c) of
+          (False, '"') -> Just True
+          (True, '"') -> Just False -- `""` is an escaped quote, not the end
+          (True, _) -> Nothing -- a quote followed by anything else ends the identifier
+          (False, _) -> Just False
+      )
+  pure $ openingQuote <> rest
 
 -- | Parses a single quoted NON standard conforming string, i.e. strings that use backslash as an escape character, and are marked
 -- by beginning with an `E`. Consecutive simple quotes are also treated as a single quote, just like in std conforming strings.
 -- See https://www.postgresql.org/docs/current/sql-syntax-lexical.html
 cStyleEscapedString :: Parser BlockOrNotBlock
 cStyleEscapedString = fmap StaticSql $ do
-  openingChars <- string "E'"
+  openingChars <- string "E'" <|> string "e'"
   rest <-
     Parsec.scan
       (False, False)
@@ -304,7 +301,7 @@ cStyleEscapedString = fmap StaticSql $ do
             ((True, False), _) -> Just (False, False) -- Any character after a backslash must be included in the string
             ((True, True), _) ->
               error
-                "Please submit this as a bug report to codd, saying both backslash and single quote were last char in cStyleEscapedString"
+                "Please submit this as a bug report to hpgsql, saying both backslash and single quote were last char in cStyleEscapedString"
       )
   pure $ openingChars <> rest
 

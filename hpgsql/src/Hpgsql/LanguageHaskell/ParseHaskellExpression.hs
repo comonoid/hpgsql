@@ -21,7 +21,7 @@ import GHC.Types.Basic (Boxity (..))
 import GHC.Types.Name (nameOccName)
 import GHC.Types.Name.Occurrence (occNameString)
 import GHC.Types.Name.Reader (RdrName (..))
-import GHC.Types.SourceText (IntegralLit (..), rationalFromFractionalLit)
+import GHC.Types.SourceText (FractionalLit (..), IntegralLit (..), rationalFromFractionalLit)
 import GHC.Types.SrcLoc (GenLocated (..), mkRealSrcLoc)
 import Hpgsql.LanguageHaskell.GhcParserOpts (fakeSettings)
 import Hpgsql.LanguageHaskell.FromThExtension (fromThToGhcLibExtension)
@@ -203,8 +203,9 @@ convertGRHSs (GRHSs _ grhss localBinds) = do
 
 convertLocalBinds :: HsLocalBinds GhcPs -> Either String [TH.Dec]
 convertLocalBinds (EmptyLocalBinds _) = Right []
-convertLocalBinds (HsValBinds _ (ValBinds _ binds _sigs)) =
-  traverse (\(L _ b) -> convertBind b) (toList binds)
+convertLocalBinds (HsValBinds _ (ValBinds _ binds sigs))
+  | null sigs = traverse (\(L _ b) -> convertBind b) (toList binds)
+  | otherwise = unsupportedLanguageFeatureMsg "Type signatures in local bindings (let/where)"
 convertLocalBinds (HsValBinds _ (XValBindsLR {})) =
   unsupportedLanguageFeatureMsg "XValBindsLR"
 convertLocalBinds (HsIPBinds {}) = unsupportedLanguageFeatureMsg "HsIPBinds"
@@ -232,11 +233,24 @@ convertClause (L _ (Match _ _ pats grhss)) = do
 
 -- Pattern conversion (GHC Pat to TH Pat)
 
+-- | Negate a Template Haskell literal. Used for negated literal patterns.
+negateLit :: TH.Lit -> TH.Lit
+negateLit (TH.IntegerL i) = TH.IntegerL (negate i)
+negateLit (TH.RationalL r) = TH.RationalL (negate r)
+negateLit (TH.IntPrimL i) = TH.IntPrimL (negate i)
+negateLit (TH.FloatPrimL r) = TH.FloatPrimL (negate r)
+negateLit (TH.DoublePrimL r) = TH.DoublePrimL (negate r)
+negateLit l = l
+
 convertPat :: Pat GhcPs -> Either String TH.Pat
 convertPat (WildPat _) = Right TH.WildP
 convertPat (VarPat _ (L _ rdr)) = Right (TH.VarP (rdrToName rdr))
 convertPat (LitPat _ lit) = TH.LitP <$> convertHsLit lit
-convertPat (NPat _ (L _ ol) _ _) = TH.LitP <$> convertOverLit ol
+convertPat (NPat _ (L _ ol) mNeg _) = do
+  lit <- convertOverLit ol
+  pure $ TH.LitP $ case mNeg of
+    Nothing -> lit
+    Just _ -> negateLit lit
 #if MIN_VERSION_ghc_lib_parser(9,10,0)
 convertPat (ConPat _ (L _ con) details) = convertConPatDetails con details
 #elif MIN_VERSION_ghc_lib_parser(9,8,0)
@@ -308,9 +322,24 @@ rdrToName (Orig _ occ) = TH.mkName (occNameString occ)
 rdrToName (Exact name) = TH.mkName (occNameString (nameOccName name))
 
 isConstructorName :: TH.Name -> Bool
-isConstructorName n = case TH.nameBase n of
+isConstructorName n = isTupleConstructorName n || case TH.nameBase n of
   (c : _) -> isUpper c || c == ':'
   _ -> False
+
+-- | Tuple data constructors (`(,)`, `(,,)`, `(#,#)`, `(#,,#)`, ...) start with a
+-- parenthesis, so they are not caught by the uppercase/`:` heuristic above and
+-- must be recognised separately.
+isTupleConstructorName :: TH.Name -> Bool
+isTupleConstructorName n =
+  case TH.nameBase n of
+    '(' : '#' : rest -> isTupleTail rest
+    '(' : rest -> isTupleTail rest
+    _ -> False
+  where
+    isTupleTail s = case reverse s of
+      ')' : '#' : inner -> not (null inner) && all (== ',') inner
+      ')' : inner -> not (null inner) && all (== ',') inner
+      _ -> False
 
 fieldLabelToString :: FieldLabelString -> String
 fieldLabelToString (FieldLabelString fs) = unpackFS fs
@@ -327,11 +356,11 @@ convertTupArg (Missing _) = Right Nothing
 convertHsLit :: HsLit GhcPs -> Either String TH.Lit
 convertHsLit (HsChar _ c) = Right (TH.CharL c)
 convertHsLit (HsString _ fs) = Right (TH.StringL (unpackFS fs))
-convertHsLit (HsInt _ il) = Right (TH.IntegerL (il_value il))
+convertHsLit (HsInt _ il) = Right (TH.IntegerL (if il_neg il then negate (il_value il) else il_value il))
 convertHsLit (HsIntPrim _ i) = Right (TH.IntPrimL i)
 convertHsLit (HsWordPrim _ w) = Right (TH.WordPrimL w)
-convertHsLit (HsFloatPrim _ fl) = Right (TH.FloatPrimL (rationalFromFractionalLit fl))
-convertHsLit (HsDoublePrim _ fl) = Right (TH.DoublePrimL (rationalFromFractionalLit fl))
+convertHsLit (HsFloatPrim _ fl) = Right (TH.FloatPrimL (fractionalLitValue fl))
+convertHsLit (HsDoublePrim _ fl) = Right (TH.DoublePrimL (fractionalLitValue fl))
 #if MIN_VERSION_ghc_lib_parser(9,10,0)
 convertHsLit (HsMultilineString _ fs) = Right (TH.StringL (unpackFS fs))
 #endif
@@ -348,14 +377,27 @@ convertHsLit (HsWord64Prim {}) = unsupportedLanguageFeatureMsg "HsWord64Prim lit
 convertHsLit (HsInteger {}) = unsupportedLanguageFeatureMsg "HsInteger literal"
 convertHsLit (HsRat {}) = unsupportedLanguageFeatureMsg "HsRat literal"
 
+-- | GHC stores the magnitude of a fractional literal in `fl_signi`/`fl_exp`
+-- and the sign separately in `fl_neg`; `rationalFromFractionalLit` drops the
+-- sign, so apply it explicitly.
+fractionalLitValue :: FractionalLit -> Rational
+fractionalLitValue fl = let r = rationalFromFractionalLit fl in if fl_neg fl then negate r else r
+
 convertOverLit :: HsOverLit GhcPs -> Either String TH.Lit
 convertOverLit ol = case ol_val ol of
-  HsIntegral il -> Right (TH.IntegerL (il_value il))
-  HsFractional fl -> Right (TH.RationalL (rationalFromFractionalLit fl))
+  HsIntegral il -> Right (TH.IntegerL (if il_neg il then negate (il_value il) else il_value il))
+  HsFractional fl -> Right (TH.RationalL (fractionalLitValue fl))
   HsIsString _ fs -> Right (TH.StringL (unpackFS fs))
 
 -- Type conversion (GHC HsType to TH Type)
 
+-- | KNOWN LIMITATION: explicit @forall@ binders in a signature inside a
+-- quasi-quoter interpolation (e.g. @#{ x :: forall a. a -> a }@) are currently
+-- dropped, leaving a free type variable behind. The binder list representation
+-- changed across the supported @ghc-lib-parser@ versions (@[LHsTyVarBndr]@ up to
+-- 9.8, @HsOuterTyVarBndrs@ from 9.10), so detecting or rebuilding them requires
+-- version-specific code. If you need such a signature, bind the expression
+-- outside the quasi-quoter and interpolate the binding instead.
 convertSigWcType :: LHsSigWcType GhcPs -> Either String TH.Type
 convertSigWcType (HsWC _ (L _ (HsSig _ _ (L _ ty)))) = convertType ty
 

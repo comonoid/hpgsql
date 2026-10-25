@@ -51,6 +51,7 @@ import Hpgsql.Builder
 import qualified Hpgsql.Builder as Builder
 import Hpgsql.Connection (ConnectOpts (..), connect, connectOpts, defaultConnectOpts, refreshTypeInfoCache, withConnectionOpts)
 import Hpgsql.Encoding (EncodingContext (..), FieldDecoder (..), FieldEncoder (..), FieldInfo (..), FromPgField (..), FromPgRow (..), LowerCasedPgEnum (..), RowDecoder, RowEncoder (..), ToPgField (..), ToPgRow (..), arrayField, compositeTypeDecoder, compositeTypeEncoder, nullableField, rawBytesFieldDecoder, singleField, typeFieldDecoder, typeFieldEncoder, typeMustBeNamed, typeOidWithName)
+import Hpgsql.Internal.InternalTypes (queryToByteString)
 import qualified Hpgsql.Internal.PinnedByteArray as PBA
 import Hpgsql.Pipeline (pipeline, pipeline1, pipeline1With, pipelineWith, runPipeline)
 import Hpgsql.Query (mkQuery, sql, vALUES)
@@ -171,6 +172,9 @@ spec = parallel $ do
     it
       "Especially optimized less-than-4-bytes long value decoders work"
       smallerThan4BytesValuesAndNullsRoundtrip
+    it
+      "vALUES numbers placeholders left-to-right"
+      vALUESNumbersPlaceholdersInRowOrder
   aroundConn $ describe "Custom types" $ do
     it "Composite type" queryCompositeType
     it
@@ -705,7 +709,7 @@ jsonTextDecoding conn = hedgehog $ do
 
 oidTextDecoding :: HPgConnection -> PropertyT IO ()
 oidTextDecoding conn = hedgehog $ do
-  oidVal :: Int32 <- Gen.forAll $ Gen.int32 (Gen.linearFrom 0 0 maxBound)
+  oidVal :: Word32 <- Gen.forAll $ Gen.word32 (Gen.linearFrom 0 0 maxBound)
   let qry = fromString $ "SELECT '" <> show oidVal <> "'::oid"
   -- Specialized row parsers of each type are a different implementation from
   -- the simpler fieldDecoders, so we need to test both
@@ -1349,6 +1353,15 @@ valuesTypeRoundTrip conn = hedgehog $ do
   resultsSingleVal <- liftIO $ query conn [sql|WITH t AS (^{vALUES rowsSingleVal}) SELECT * FROM t|]
   List.sort results2Tuple === List.sort rows2Tuple
   List.sort resultsSingleVal === List.sort rowsSingleVal
+
+-- | `vALUES` must number query arguments left-to-right (row by row), so that the
+-- parameter list, which is concatenated in the same order, lines up with the
+-- placeholders. Sorting rows (as `valuesTypeRoundTrip` does) cannot observe a
+-- reversal, so we check the generated SQL directly.
+vALUESNumbersPlaceholdersInRowOrder :: Expectation
+vALUESNumbersPlaceholdersInRowOrder =
+  queryToByteString (vALUES [(1 :: Int, True), (2 :: Int, False), (3 :: Int, True)])
+    `shouldBe` "VALUES ($1,$2),($3,$4),($5,$6)"
 
 domainTypesDecodeIntoLargerHaskellTypes :: HPgConnection -> IO ()
 domainTypesDecodeIntoLargerHaskellTypes conn = withRollback conn $ do

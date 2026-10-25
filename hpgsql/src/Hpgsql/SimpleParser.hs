@@ -57,13 +57,14 @@ newtype Parser a = Parser
       (String -> r) ->
       -- \^ failure continuation
       (a -> ByteStringIdx -> PinnedByteArray -> r) ->
-      -- \^ success continuation, taking original or new PinnedByteArray, the index into the original/new bytestring of the first yet-unparsed byte, and parsed value
+      -- \^ success continuation, taking the parsed value, the index of the first
+      -- yet-unparsed byte, and the (possibly updated) PinnedByteArray
       r
   }
 
 instance Functor Parser where
   fmap f (Parser p) = Parser $ \idx bs kf ks ->
-    p idx bs kf (\a bs' -> ks (f a) bs')
+    p idx bs kf (\a idx' -> ks (f a) idx')
   {-# INLINE fmap #-}
 
 instance Applicative Parser where
@@ -71,7 +72,7 @@ instance Applicative Parser where
   {-# INLINE pure #-}
 
   Parser pf <*> Parser pa = Parser $ \idx bs kf ks ->
-    pf idx bs kf (\f bs' idx' -> pa bs' idx' kf (\a bs'' idx'' -> ks (f a) bs'' idx''))
+    pf idx bs kf (\f idx' bs' -> pa idx' bs' kf (\a idx'' bs'' -> ks (f a) idx'' bs''))
   {-# INLINE (<*>) #-}
 
 instance Alternative Parser where
@@ -86,7 +87,7 @@ instance Monad Parser where
   {-# INLINE return #-}
 
   Parser p >>= k = Parser $ \idx bs kf ks ->
-    p idx bs kf (\a bs' idx' -> unParser (k a) bs' idx' kf ks)
+    p idx bs kf (\a idx' bs' -> unParser (k a) idx' bs' kf ks)
   {-# INLINE (>>=) #-}
 
 instance MonadFail Parser where
@@ -113,8 +114,7 @@ take :: Int -> Parser PinnedByteArray
 take n = Parser $ \idx sbs kf ks ->
   let skip' = n + idx.idx
    in if PBA.length sbs >= skip'
-        -- TODO: dropAndTake in a single call
-        then case PBA.take n $ PBA.drop idx.idx sbs of
+        then case PBA.dropAndTake idx.idx n sbs of
           -- Strict on the bytestring because we're pretty sure
           -- the field decoder will need to evaluate this anyway,
           -- so no need for an extra thunk

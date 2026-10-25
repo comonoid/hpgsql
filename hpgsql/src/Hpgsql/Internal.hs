@@ -290,7 +290,22 @@ internalConnectOrCancel connectOrCancel connOpts originalConnStr@ConnectionStrin
               preparedStatementNames = mempty,
               transactionStatusBeforeCurrentPipeline = TransIdle
             }
-      let hpgConnPartialDoNotReturn = HPgConnection sock socketIsClosed recvBuffer sendBuffer socketMutex originalConnStr addrInfo encodingContext connParams currentConnectionState 0 "" connOpts
+      let hpgConnPartialDoNotReturn =
+            HPgConnection
+              { socket = sock,
+                socketClosed = socketIsClosed,
+                recvBuffer = recvBuffer,
+                sendBuffer = sendBuffer,
+                socketMutex = socketMutex,
+                originalConnStr = originalConnStr,
+                connectedTo = addrInfo,
+                encodingContext = encodingContext,
+                parameterStatusMap = connParams,
+                internalConnectionState = currentConnectionState,
+                connPid = 0,
+                cancelSecretKey = "",
+                connOpts = connOpts
+              }
       case connectOrCancel of
         CancelNotConnect cancelRequest _ -> do
           nonAtomicSendMsg hpgConnPartialDoNotReturn cancelRequest
@@ -425,9 +440,12 @@ refreshTypeInfoCache conn =
       let customTypes = buildTypeInfoCache $ map (\(oid, typname, typarray, typelem, typcategory, typtype, typbasetype) -> TypeInfo oid typname (if typarray == 0 then Nothing else Just typarray) (toTypeDetails typelem typcategory typtype typbasetype)) queryResults
       modifyMVar_ conn.encodingContext $ \_ -> pure $ EncodingContext $ customTypes <> builtinPgTypesMap
     toTypeDetails typelem typcategory typtype typbasetype = case (typcategory, typtype) of
+      -- Domains must be recognised before arrays: a domain over an array type
+      -- inherits typcategory='A' from its base, so checking 'A' first would
+      -- misclassify such a domain as an array (with typelem=0).
+      (_, 'd') -> DomainType (DomainTypeDetails typbasetype)
       ('A', _) -> ArrayType (ArrayTypeDetails typelem)
       (_, 'c') -> CompositeType
-      (_, 'd') -> DomainType (DomainTypeDetails typbasetype)
       (_, 'e') -> EnumType
       (_, 'p') -> PseudoType
       (_, 'r') -> RangeType
@@ -1441,8 +1459,8 @@ consumeStreamingResults rp conn qryId = S.effect $ do
           colInfos = map mkColInfo coltypes
       !rowparser <- case rp of
         ApplicativeRowDecoder (RowDecoder rparser rtypecheck expectedNumCols) -> do
-          let typecheckedColInfos = rtypecheck colInfos
           unless (numResultColumns == expectedNumCols) $ throwIrrecoverableErrorWithStatement qText $ "Query result contains " <> Text.pack (show numResultColumns) <> " columns but row parser expected " <> Text.pack (show expectedNumCols)
+          let typecheckedColInfos = rtypecheck colInfos
           unless (all snd typecheckedColInfos) $ throwIrrecoverableErrorWithStatement qText "Query result column types do not match expected column types"
           pure $ Parser.skip 7 *> rparser colInfos -- Skip msg ident., length, number of columns, then parse fields
         MonadicRowDecoder (RowDecoderMonadic rparser) ->
@@ -1562,9 +1580,28 @@ withCopyInternal conn (lastAndInitNE . breakQueryIntoStatements -> (firstQueries
     )
     (pure ())
     $ \(qryId :| _) -> do
-      void $ receiveOutstandingResponseMsgsAtomically thisThreadId conn qryId
-      void $ receiveOutstandingResponseMsgsAtomically thisThreadId conn qryId
-      void $ receiveOutstandingResponseMsgsAtomically thisThreadId conn qryId
+      -- Receive control messages until the backend enters COPY mode or reports
+      -- an error. On the error path we drain the query (which sends the Sync the
+      -- backend is waiting for and throws the PostgresError), so the connection
+      -- stays usable and `copyFn` is never run against a COPY that failed to
+      -- start.
+      let receiveCopyInResponseOrThrow = do
+            (_, state) <- receiveOutstandingResponseMsgsAtomically thisThreadId conn qryId
+            case state of
+              RowDescriptionOrNoDataOrCopyInResponseReceived (Right3 CopyInResponse) -> pure ()
+              RowDescriptionOrNoDataOrCopyInResponseReceived (Left3 _) ->
+                throwIrrecoverableErrorWithStatement queryString "Expected a COPY FROM STDIN statement, but the statement did not start a COPY"
+              RowDescriptionOrNoDataOrCopyInResponseReceived (Middle3 _) ->
+                throwIrrecoverableErrorWithStatement queryString "Expected a COPY FROM STDIN statement, but the statement returns rows"
+              -- The backend is in the extended-query error state and will only
+              -- emit ReadyForQuery once it receives a Sync. `copyEndInternal`
+              -- sends CopyDone+Sync, drains the response and throws the error.
+              ErrorResponseReceived _ _ -> void $ copyEndInternal conn qryId
+              ReadyForQueryReceived (Left err) _ -> throwPostgresError queryString err
+              ReadyForQueryReceived (Right _) _ ->
+                throwIrrecoverableErrorWithStatement queryString "Expected a COPY FROM STDIN statement, but the statement completed without starting a COPY"
+              _ -> receiveCopyInResponseOrThrow
+      receiveCopyInResponseOrThrow
       copyFn qryId
 
 -- | Copies rows into a table with the binary COPY protocol.

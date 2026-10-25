@@ -26,6 +26,7 @@ import Data.ByteString.Unsafe (unsafeUseAsCStringLen)
 import Data.Int (Int64)
 import Foreign (Ptr, Storable (..), Word8, allocaArray, castPtr, nullPtr, plusPtr)
 import Foreign.C (CInt (..), CSize (..), eAGAIN, eWOULDBLOCK, getErrno)
+import Foreign.C.Error (Errno (..))
 import GHC.Base (Addr#)
 import Hpgsql.Internal.PinnedByteArray (PinnedByteArray, createPinnedByteArray)
 import Network.Socket (Socket, withFdSocket)
@@ -52,8 +53,9 @@ recvNonBlocking s nbytes = withFdSocket s $ \fd -> createPinnedByteArray nbytes 
         then do
           -- putStrLn $ "Asked for " ++ show nbytes ++ ", but got eAGAIN"
           pure 0
-        else
-          throw $ userError "Internal error in hpgsql's recvNonBlocking"
+        else do
+          let Errno errNo = err
+          throw $ userError $ "Internal error in hpgsql's recvNonBlocking (errno " ++ show errNo ++ ")"
 
 sendNonBlocking :: Socket -> L.ByteString -> IO Int64
 sendNonBlocking s lbs = do

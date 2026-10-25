@@ -22,7 +22,7 @@ where
 -- TODO: We should test these scenarios, but we don't yet.
 
 import Control.Applicative ((<|>))
-import Control.Monad (void)
+import Control.Monad (unless, void)
 import Crypto.Hash (Digest, SHA256, hash)
 import Crypto.KDF.PBKDF2 (Parameters (..), fastPBKDF2_SHA256)
 import Crypto.MAC.HMAC (HMAC, hmac, hmacGetDigest)
@@ -128,6 +128,11 @@ handleServerFirstMsg ::
   Either String ScramClientFinalMessage
 handleServerFirstMsg (encodeUtf8 -> password) ScramClientFirstMessage {gs2Header, clientFirstBare} serverFirst = do
   (serverNonce, salt, iterations) <- parseServerFirst serverFirst.fullMessage
+  -- RFC 5802 §3: the server nonce MUST be the client nonce followed by one or
+  -- more additional characters. Verify this to guard against nonce reflection.
+  let clientNonce = BS.drop 5 clientFirstBare -- "n=,r=" prefix
+  unless (clientNonce `BS.isPrefixOf` serverNonce && BS.length serverNonce > BS.length clientNonce) $
+    Left "Server nonce does not extend the client nonce"
   let saltedPassword = hi salt iterations -- "hi" takes the password implicitly
       clientKey = hmacSHA256 saltedPassword "Client Key"
       storedKey = hashSHA256 clientKey

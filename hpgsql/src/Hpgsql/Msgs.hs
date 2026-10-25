@@ -18,8 +18,9 @@ import Data.Int (Int16, Int32)
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
 import Data.Maybe (fromMaybe, mapMaybe)
-import Data.Text (Text)
-import Data.Text.Encoding (decodeASCII, decodeUtf8, encodeUtf8)
+import Data.Text (Text, pack)
+import Data.Text.Encoding (decodeASCII, decodeUtf8With, encodeUtf8)
+import Data.Text.Encoding.Error (lenientDecode)
 import Data.Word (Word8)
 import Hpgsql.Builder (BinaryField, Builder, builderLength)
 import qualified Hpgsql.Builder as Builder
@@ -53,16 +54,16 @@ colParser :: Parsec.Parser (Text, Oid)
 colParser = do
   colName <- nulTerminatedCStringParser -- Column name as C string
   void $ Parsec.take (4 + 2)
-  -- TODO: OIDs are unsigned integers! Try `select (-1)::oid` to see. Change to UInt32 somehow
-  typOid <- either fail pure . PBA.decodeInt32BE 0 . PBA.fromByteString =<< Parsec.take 4
+  -- OIDs are unsigned integers (see `Oid` in Hpgsql.TypeInfo)
+  typOid <- either fail pure . PBA.decodeWord32BE 0 . PBA.fromByteString =<< Parsec.take 4
   void $ Parsec.take (2 + 4 + 2)
-  pure (colName, Oid (fromIntegral typOid))
+  pure (colName, Oid typOid)
 
 nulTerminatedCStringParser :: Parsec.Parser Text
 nulTerminatedCStringParser = do
   stringWithoutNul <- Parsec.takeWhile (/= 0)
   Parsec.skip (== 0)
-  pure $ decodeUtf8 stringWithoutNul
+  pure $ decodeUtf8With lenientDecode stringWithoutNul
 
 newtype AuthenticationResponse = AuthenticationResponse AuthenticationMethod
   deriving stock (Show)
@@ -195,7 +196,7 @@ instance ToPgMessage CopyData where
 instance ToPgMessage CopyFail where
   toPgMessage (CopyFail bs) =
     let cstr = nulTermCString bs
-     in Builder.char7 'f' <> Builder.int32BE (4 + fromIntegral (length bs) + 1) <> cstr
+     in Builder.char7 'f' <> Builder.int32BE (4 + builderLength cstr) <> cstr
 
 instance ToPgMessage CopyDone where
   toPgMessage CopyDone =
@@ -211,7 +212,7 @@ instance ToPgMessage Execute where
     let unnamedPortal = nulTermCString ""
         infiniteRowsToReturn :: Int32 = 0
         contents = unnamedPortal <> Builder.int32BE infiniteRowsToReturn
-        contentsLen = fromIntegral $ LBS.length $ Builder.toLazyByteString contents
+        contentsLen = builderLength contents
      in Builder.char7 'E' <> Builder.int32BE (4 + contentsLen) <> contents
 
 instance ToPgMessage Flush where
@@ -250,8 +251,8 @@ instance ToPgMessage PasswordMessage where
     let passwordBs = case crypt of
           AuthCleartextPassword -> nulTermCString password
           AuthMD5Password (LBS.toStrict -> salt) ->
-            let passwordBytes = Builder.toStrictByteString (Builder.string7 password)
-                usernameBytes = Builder.toStrictByteString (Builder.string7 username)
+            let passwordBytes = encodeUtf8 (pack password)
+                usernameBytes = encodeUtf8 (pack username)
                 innerHex = bytestringToHex (md5Hash (passwordBytes <> usernameBytes))
                 outerHex = bytestringToHex (md5Hash (innerHex <> salt))
              in Builder.byteString "md5" <> Builder.byteString outerHex <> Builder.word8 0
@@ -290,7 +291,7 @@ instance ToPgMessage Terminate where
     Builder.char7 'X' <> Builder.int32BE 4
 
 nulTermCString :: String -> Builder
-nulTermCString s = Builder.string7 s <> Builder.word8 0
+nulTermCString s = Builder.byteString (encodeUtf8 (pack s)) <> Builder.word8 0
 
 bytestringToHex :: ByteString -> ByteString
 bytestringToHex = BS.concatMap (\w -> let (hi, lo) = w `divMod` 16 in BS.pack [hexChar hi, hexChar lo])
@@ -320,7 +321,7 @@ instance ToPgMessage Bind where
               (const $ Builder.int16BE 1)
               [1 .. resultColumnFmts]
         contents = unnamedDestPortal <> preparedStmtName <> Builder.int16BE numParamFmtCodesAllBinary <> Builder.int16BE fmtCodesBinary <> Builder.int16BE numQryParams <> paramsLenAndVals <> Builder.int16BE numResultColumnsFmtCodes <> resultColumnsFmtCodes
-        contentsLen = fromIntegral $ LBS.length $ Builder.toLazyByteString contents
+        contentsLen = builderLength contents
      in Builder.char7 'B' <> Builder.int32BE (4 + contentsLen) <> contents
 
 instance ToPgMessage Parse where
@@ -328,9 +329,9 @@ instance ToPgMessage Parse where
     let preparedStmtName = nulTermCString $ fromMaybe "" preparedStmtHash
         numParamsSpecified :: Int16 = fromIntegral $ length specifiedParameterTypes
         -- A 0 for an OID means "type unspecified", and is what we use when we don't know the type
-        paramOids = mconcat $ map (Builder.int32BE . maybe 0 fromIntegral) specifiedParameterTypes
+        paramOids = mconcat $ map (Builder.int32BE . maybe 0 (\(Oid o) -> fromIntegral o)) specifiedParameterTypes
         contents = preparedStmtName <> Builder.byteString queryString <> Builder.word8 0 <> Builder.int16BE numParamsSpecified <> paramOids
-        contentsLen = fromIntegral $ LBS.length $ Builder.toLazyByteString contents
+        contentsLen = builderLength contents
      in Builder.char7 'P' <> Builder.int32BE (4 + contentsLen) <> contents
 
 instance ToPgMessage StartupMessage where
@@ -341,7 +342,7 @@ instance ToPgMessage StartupMessage where
         databaseBS = nulTermCString "database" <> nulTermCString database
         optionsBS = nulTermCString "options" <> nulTermCString options
         contents = Builder.int16BE protocolMajorVersion <> Builder.int16BE protocolMinorVersion <> userBS <> databaseBS <> optionsBS <> Builder.word8 0
-        contentsLen = fromIntegral $ LBS.length $ Builder.toLazyByteString contents
+        contentsLen = builderLength contents
      in -- TODO: What protocol version do we announce? We're following the example from the docs for now
         -- TODO: Can we send things like client_encoding, DateStyle, et. al as options here?
 

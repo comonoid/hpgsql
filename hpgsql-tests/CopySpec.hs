@@ -3,6 +3,7 @@ module CopySpec where
 import Control.Monad (forM_)
 import Control.Monad.IO.Class (liftIO)
 import Data.Int (Int32, Int64)
+import Data.IORef (newIORef, readIORef, writeIORef)
 import Data.Text (Text)
 import qualified Data.Text as Text
 import qualified Data.Text.Encoding as TE
@@ -37,6 +38,9 @@ spec = do
     it
       "putCopyError"
       copyError
+    it
+      "COPY that fails to start does not run the callback"
+      copyErrorBeforeCallback
 
 genRows :: Gen.Gen [(Int32, Text, Int64)]
 genRows = do
@@ -94,5 +98,19 @@ copyErrorPutCopyError conn = do
     putCopyData conn "5,Dracula\n"
     putCopyError conn "Abort"
     transactionStatus conn `shouldReturn` TransInError
+  execute_ conn "SELECT 1"
+  transactionStatus conn `shouldReturn` TransIdle
+
+copyErrorBeforeCallback :: HPgConnection -> IO ()
+copyErrorBeforeCallback conn = do
+  withRollback conn $ do
+    callbackRan <- newIORef False
+    withCopy_
+      conn
+      "COPY table_that_does_not_exist FROM STDIN WITH (FORMAT CSV);"
+      (writeIORef callbackRan True)
+      `shouldThrow` pgErrorMustContain "COPY table_that_does_not_exist FROM STDIN" [(ErrorSeverity, "ERROR"), (ErrorCode, "42P01")]
+    -- The user callback must not run against a COPY that never started.
+    readIORef callbackRan `shouldReturn` False
   execute_ conn "SELECT 1"
   transactionStatus conn `shouldReturn` TransIdle

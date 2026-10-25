@@ -99,14 +99,17 @@ module Hpgsql.TypeInfo
   )
 where
 
-import Data.Int (Int32)
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
 import Data.Text (Text)
+import Data.Word (Word32)
 
-newtype Oid = Oid Int32
+-- | PostgreSQL object identifier. Note that these are unsigned 32-bit values.
+-- `Num` is derived only so the many `Oid`-typed numeric literals in the builtin
+-- type table below can be written plainly.
+newtype Oid = Oid Word32
   deriving stock (Show)
-  deriving newtype (Eq, Real, Num, Ord, Integral, Enum)
+  deriving newtype (Eq, Ord, Num)
 
 data TypeInfo = TypeInfo
   { typeOid :: !Oid,
@@ -139,10 +142,19 @@ lookupTypeByName :: Text -> TypeInfoCache -> Maybe TypeInfo
 lookupTypeByName n (TypeInfoCache _ m) = Map.lookup n m
 
 buildTypeInfoCache :: [TypeInfo] -> TypeInfoCache
-buildTypeInfoCache ts = TypeInfoCache tsByOid tsByName
-  where
-    tsByOid = Map.fromList $ map (\ti -> (ti.typeOid, ti)) ts
-    tsByName = Map.fromList $ map (\ti -> (ti.typeName, ti)) ts
+buildTypeInfoCache ts =
+  let tsByOid = Map.fromList $ map (\ti -> (ti.typeOid, ti)) ts
+      -- Type names are not unique across schemas (e.g. there are two types named
+      -- `_pg_user_mappings`: the `pg_catalog` array type and an `information_schema`
+      -- view). The list is ordered by OID, so the first occurrence of a name is the
+      -- `pg_catalog` one; keep that one deterministically instead of silently letting
+      -- `Map.fromList`'s last-wins behaviour mask duplicates.
+      tsByName = Map.fromListWith (flip const) $ map (\ti -> (ti.typeName, ti)) ts
+   in -- OIDs, unlike names, must be unique. A duplicate would silently drop a
+      -- type from the lookup table, so surface it as a bug instead.
+      if Map.size tsByOid == length ts
+        then TypeInfoCache tsByOid tsByName
+        else error $ "Bug in Hpgsql: duplicate type OIDs in buildTypeInfoCache (" <> show (Map.size tsByOid) <> " distinct OIDs for " <> show (length ts) <> " types)"
 
 newtype EncodingContext = EncodingContext
   { -- | A map with all builtin PostgreSQL types plus
@@ -622,7 +634,7 @@ builtinPgTypesMap =
       TypeInfo pg_stat_progress_basebackupOid "pg_stat_progress_basebackup" (Just 12322) CompositeType,
       TypeInfo _pg_stat_progress_copyOid "_pg_stat_progress_copy" Nothing (ArrayType (ArrayTypeDetails 12328)),
       TypeInfo pg_stat_progress_copyOid "pg_stat_progress_copy" (Just 12327) CompositeType,
-      TypeInfo _pg_user_mappingsOid "_pg_user_mappings" Nothing (ArrayType (ArrayTypeDetails 12333)),
+      TypeInfo _pg_user_mappingsArrayOid "_pg_user_mappings" Nothing (ArrayType (ArrayTypeDetails 12333)),
       TypeInfo pg_user_mappingsOid "pg_user_mappings" (Just 12332) CompositeType,
       TypeInfo _pg_replication_origin_statusOid "_pg_replication_origin_status" Nothing (ArrayType (ArrayTypeDetails 12338)),
       TypeInfo pg_replication_origin_statusOid "pg_replication_origin_status" (Just 12337) CompositeType,
@@ -2598,6 +2610,12 @@ foreign_tablesOid = Oid 13614
 
 __pg_user_mappingsOid :: Oid
 __pg_user_mappingsOid = Oid 13617
+
+-- The `pg_catalog` array type `_pg_user_mappings` (array of `pg_user_mappings`,
+-- OID 12333). Its name collides with the `information_schema` view of the same
+-- name (`_pg_user_mappingsOid` below), so it needs its own binding.
+_pg_user_mappingsArrayOid :: Oid
+_pg_user_mappingsArrayOid = Oid 12332
 
 _pg_user_mappingsOid :: Oid
 _pg_user_mappingsOid = Oid 13618
